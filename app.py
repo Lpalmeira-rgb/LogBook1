@@ -10,12 +10,11 @@ st.set_page_config(
 
 st.title("⚓ Sistema de Divisão Diária de Horários ROV")
 st.markdown(
-    "Divisão equilibrada de pilotagem para o dia de lançamento. "
-    "Supervisores com 10% do tempo do veículo e equilíbrio entre os 4"
-    " pilotos."
+    "Divisão equilibrada de pilotagem limitada estritamente aos horários do"
+    " turno (06h-18h / 18h-06h) e com alocação randomizada a cada execução."
 )
 
-# --- SIDEBAR: CADASTRO DE EQUIPE E SELEÇÃO DE TURNO ---
+# --- SIDEBAR: CONFIGURAÇÕES DO LANÇAMENTO ---
 st.sidebar.header("⚙️ Configurações do Lançamento")
 
 data_logbook = st.sidebar.date_input(
@@ -82,16 +81,39 @@ def parse_horario_turno(
 ) -> datetime:
   dt = datetime.strptime(f"{datastr} {horastr}", "%Y-%m-%d %H:%M")
   if shift_noite and dt.hour < 12:
-    dt += timedelta(days=1)  # Ajusta madrugadas para a data do dia seguinte
+    dt += timedelta(days=1)
   return dt
 
 
-# --- CALCULO E RATEIO EQUILIBRADO DO DIA ---
+def aplicar_limite_turno(
+    dt_i: datetime, dt_f: datetime, data_base_str: str, shift_noite: bool
+):
+  """Limita o horário do mergulho estritamente dentro da janela do turno (06h-18h ou 18h-06h)."""
+  base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
+  if not shift_noite:
+    limite_inicio = base_dt.replace(hour=6, minute=0)
+    limite_fim = base_dt.replace(hour=18, minute=0)
+  else:
+    limite_inicio = base_dt.replace(hour=18, minute=0)
+    limite_fim = base_dt.replace(hour=6, minute=0) + timedelta(days=1)
+
+  # Aplica o corte se estrapolar o turno
+  eff_start = max(dt_i, limite_inicio)
+  eff_end = min(dt_f, limite_fim)
+
+  if eff_start < eff_end:
+    return eff_start, eff_end
+  return None, None
+
+
+# --- CALCULO E RATEIO EQUILIBRADO ---
 if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
   supervisores = {"UHD68": sup_68, "UHD69": sup_69}
-  pilotos = [p1, p2, p3, p4]
 
-  # Dicionário de rastreamento EXCLUSIVO para as horas do próprio dia
+  # Randomização dos pilotos a cada clique do botão
+  pilotos = [p1, p2, p3, p4]
+  random.shuffle(pilotos)
+
   horas_do_dia = {p: 0.0 for p in [sup_68, sup_69] + pilotos}
 
   mergulhos_68 = [
@@ -113,16 +135,22 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
     dt_f = parse_horario_turno(f, data_base_str, is_turno_noite)
     if dt_f <= dt_i:
       dt_f += timedelta(days=1)
-    lista_mergulhos.append(("UHD68", dt_i, dt_f))
+
+    s, e = aplicar_limite_turno(dt_i, dt_f, data_base_str, is_turno_noite)
+    if s and e:
+      lista_mergulhos.append(("UHD68", s, e))
 
   for i, f in mergulhos_69:
     dt_i = parse_horario_turno(i, data_base_str, is_turno_noite)
     dt_f = parse_horario_turno(f, data_base_str, is_turno_noite)
     if dt_f <= dt_i:
       dt_f += timedelta(days=1)
-    lista_mergulhos.append(("UHD69", dt_i, dt_f))
 
-  lista_mergulhos.sort(key=lambda m: m[1])  # Ordena cronologicamente
+    s, e = aplicar_limite_turno(dt_i, dt_f, data_base_str, is_turno_noite)
+    if s and e:
+      lista_mergulhos.append(("UHD69", s, e))
+
+  lista_mergulhos.sort(key=lambda m: m[1])
 
   agenda_ocupacao = {p: [] for p in horas_do_dia.keys()}
   registros = []
@@ -137,12 +165,15 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
     duracao_min = int((dt_fim - dt_inicio).total_seconds() / 60)
     sup_fixo = supervisores[rov]
 
-    # REGRA: Supervisor tem exatamente 10% do tempo de pilotagem do seu ROV
     sup_minutos = max(15, int(round(duracao_min * 0.10)))
     pilotos_minutos = duracao_min - sup_minutos
 
-    # Seleciona os pilotos que possuem MENOS horas acumuladas NO PRÓPRIO DIA
-    pilotos_ordenados = sorted(pilotos, key=lambda p: horas_do_dia[p])
+    # Ordena pelo menor saldo de horas no dia, desempatando de forma aleatória
+    pilotos_candidatos = pilotos.copy()
+    random.shuffle(pilotos_candidatos)
+    pilotos_ordenados = sorted(
+        pilotos_candidatos, key=lambda p: (horas_do_dia[p], random.random())
+    )
 
     qtd_pilotos = 2
     pilotos_disponiveis = []
@@ -155,7 +186,6 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
     if not pilotos_disponiveis:
       pilotos_disponiveis = [pilotos_ordenados[0]]
 
-    # Divisão dos 90% do tempo entre os pilotos do bloco
     n_p = len(pilotos_disponiveis)
     base_p = pilotos_minutos // n_p
     fatias_pilotos = []
@@ -167,7 +197,6 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
       restante -= bloco
     fatias_pilotos.append(restante)
 
-    # Montagem dos horários contínuos
     slots = []
     sup_dt_s = dt_inicio
     sup_dt_e = dt_inicio + timedelta(minutes=sup_minutos)
@@ -210,7 +239,6 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
   st.success("✅ Tabela do Logbook Gerada!")
   st.dataframe(df_res, use_container_width=True)
 
-  # Resumo das horas totais trabalhadas estritamente no dia
   st.subheader("📊 Total de Horas Pilotadas no Dia por Colaborador")
   df_saldos = pd.DataFrame(
       list(horas_do_dia.items()), columns=["Colaborador", "Total Horas no Dia (h)"]
