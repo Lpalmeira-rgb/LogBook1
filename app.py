@@ -13,8 +13,8 @@ st.title("⚓ Sistema de Lançamento de Horários ROV")
 st.markdown(
     "Escolha entre **Lançamento Único (Consolidado)** ou **Horários Exatos"
     " (Múltiplos Lançamentos)** com trava de turno, equipe dinâmica de"
-    " pilotos, cota de supervisor e divisão rigorosamente igualitária entre"
-    " todos os pilotos."
+    " pilotos, priorização de piloto extra para atuar nos dois ROVs e"
+    " alocação aleatória ou manual por veículo."
 )
 
 # --- SIDEBAR: CONFIGURAÇÕES DO LANÇAMENTO ---
@@ -77,11 +77,37 @@ nomes_padrao = [
 pilotos = []
 for i in range(int(qtd_pilotos)):
   p_default = nomes_padrao[i] if i < len(nomes_padrao) else f"Piloto {i+1}"
-  p_nome = st.sidebar.text_input(
-      f"Piloto {i+1}", p_default, key=f"piloto_input_{i}"
-  )
+  label_p = f"Piloto {i+1} (Extra)" if i >= 4 else f"Piloto {i+1}"
+  p_nome = st.sidebar.text_input(label_p, p_default, key=f"piloto_input_{i}")
   if p_nome.strip():
     pilotos.append(p_nome.strip())
+
+# --- MODO DE ALOCAÇÃO NOS VEÍCULOS ---
+st.sidebar.subheader("🚤 Alocação nos ROVs")
+modo_alocacao_rov = st.sidebar.radio(
+    "Forma de Alocação dos Pilotos",
+    [
+        "Aleatória (Priorizando Extra nos 2 ROVs)",
+        "Manual (Escolher ROV por Piloto)",
+    ],
+)
+
+alocacao_manual = {}
+if modo_alocacao_rov.startswith("Manual"):
+  st.sidebar.markdown("**Defina o ROV de cada piloto:**")
+  for idx, p in enumerate(pilotos):
+    if idx < 2:
+      idx_padrao = 0
+    elif idx < 4:
+      idx_padrao = 1
+    else:
+      idx_padrao = 2
+    alocacao_manual[p] = st.sidebar.selectbox(
+        f"ROV para {p}",
+        ["UHD68", "UHD69", "Ambos (UHD68 e UHD69)"],
+        index=idx_padrao,
+        key=f"alloc_man_{idx}_{p}",
+    )
 
 # --- AJUSTE DE PORCENTAGENS DE DIVISÃO ---
 st.sidebar.subheader("⚖️ Porcentagens da Divisão")
@@ -232,6 +258,10 @@ def gerar_excel_bytes(df):
   return output.getvalue()
 
 
+def eh_piloto_extra(nome_p, idx_original):
+  return idx_original >= 4 or "extra" in nome_p.lower()
+
+
 # --- PROCESSAMENTO DO LOGBOOK ---
 if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
   if not pilotos:
@@ -246,8 +276,10 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
 
   supervisores = {"UHD68": sup_68, "UHD69": sup_69}
 
-  pilotos_embaralhados = pilotos.copy()
-  random.shuffle(pilotos_embaralhados)
+  titulares = [
+      p for idx, p in enumerate(pilotos) if not eh_piloto_extra(p, idx)
+  ]
+  extras = [p for idx, p in enumerate(pilotos) if eh_piloto_extra(p, idx)]
 
   mergulhos_68_inputs = [
       extrair_horario(m)
@@ -271,7 +303,7 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
   horas_do_dia = {p: 0.0 for p in [sup_68, sup_69] + pilotos}
 
   # =========================================================================
-  # MODO 1: LANÇAMENTO ÚNICO CONSOLIDADO COM POOL IGUALITÁRIO GLOBAL
+  # MODO 1: LANÇAMENTO ÚNICO CONSOLIDADO
   # =========================================================================
   if is_modo_unico:
 
@@ -337,11 +369,48 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
           "cursor": dt_start + timedelta(minutes=sup_min),
       }
 
+    rovs_ativos = sorted(rov_pools.keys(), key=lambda r: rov_pools[r]["cursor"])
     metas_pilotos = calcular_metas_pilotos(
-        pilotos_embaralhados, total_pool_pilotos, pct_pilotos_custom
+        pilotos, total_pool_pilotos, pct_pilotos_custom
     )
 
-    agenda_pilotos = {p: [] for p in pilotos_embaralhados}
+    rovs_permitidos = {}
+    if modo_alocacao_rov.startswith("Manual"):
+      for p in pilotos:
+        escolha = alocacao_manual.get(p, "Ambos (UHD68 e UHD69)")
+        if escolha == "UHD68":
+          rovs_permitidos[p] = ["UHD68"]
+        elif escolha == "UHD69":
+          rovs_permitidos[p] = ["UHD69"]
+        else:
+          rovs_permitidos[p] = rovs_ativos.copy()
+    else:
+      titulares_emb = titulares.copy()
+      extras_emb = extras.copy()
+      random.shuffle(titulares_emb)
+      random.shuffle(extras_emb)
+
+      if len(rovs_ativos) == 2:
+        meio = (len(titulares_emb) + 1) // 2
+        grupo_r1 = titulares_emb[:meio]
+        grupo_r2 = titulares_emb[meio:]
+        for p in grupo_r1:
+          rovs_permitidos[p] = [rovs_ativos[0]]
+        for p in grupo_r2:
+          rovs_permitidos[p] = [rovs_ativos[1]]
+        for p in extras_emb:
+          rovs_permitidos[p] = rovs_ativos.copy()
+      else:
+        for p in pilotos:
+          rovs_permitidos[p] = rovs_ativos.copy()
+
+    ordem_pilotos = [p for p in pilotos if len(rovs_permitidos[p]) == 1]
+    random.shuffle(ordem_pilotos)
+    pilotos_ponte = [p for p in pilotos if len(rovs_permitidos[p]) > 1]
+    random.shuffle(pilotos_ponte)
+    fila_pilotos = ordem_pilotos + pilotos_ponte
+
+    agenda_pilotos = {p: [] for p in pilotos}
 
     def tem_conflito_horario(pessoa, s, e):
       for os, oe in agenda_pilotos[pessoa]:
@@ -349,16 +418,20 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
           return True
       return False
 
-    rovs_ativos = sorted(rov_pools.keys(), key=lambda r: rov_pools[r]["cursor"])
-
-    for p in pilotos_embaralhados:
+    for p in fila_pilotos:
       necessario = metas_pilotos[p]
       if necessario <= 0:
         continue
 
-      for rov in rovs_ativos:
+      lista_rovs_tentativa = rovs_permitidos[p] + [
+          r for r in rovs_ativos if r not in rovs_permitidos[p]
+      ]
+
+      for rov in lista_rovs_tentativa:
         if necessario <= 0:
           break
+        if rov not in rov_pools:
+          continue
         pool = rov_pools[rov]
         disponivel = pool["p_min_restante"]
         if disponivel <= 0:
@@ -424,12 +497,31 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
     lista_mergulhos.sort(key=lambda m: m[1])
 
     agenda_ocupacao = {p: [] for p in horas_do_dia.keys()}
+    rovs_operados_por_piloto = {p: set() for p in pilotos}
 
     def tem_conflito(pessoa, inicio, fim):
       for s, e in agenda_ocupacao[pessoa]:
         if max(inicio, s) < min(fim, e):
           return True
       return False
+
+    preferencia_rov_m2 = {}
+    if modo_alocacao_rov.startswith("Manual"):
+      for p in pilotos:
+        esc = alocacao_manual.get(p, "Ambos (UHD68 e UHD69)")
+        preferencia_rov_m2[p] = (
+            ["UHD68", "UHD69"] if "Ambos" in esc else [esc]
+        )
+    else:
+      tit_emb = titulares.copy()
+      random.shuffle(tit_emb)
+      meio = (len(tit_emb) + 1) // 2
+      for p in tit_emb[:meio]:
+        preferencia_rov_m2[p] = ["UHD68"]
+      for p in tit_emb[meio:]:
+        preferencia_rov_m2[p] = ["UHD69"]
+      for p in extras:
+        preferencia_rov_m2[p] = ["UHD68", "UHD69"]
 
     for rov, dt_inicio, dt_fim in lista_mergulhos:
       duracao_min = int((dt_fim - dt_inicio).total_seconds() / 60)
@@ -438,11 +530,18 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
       sup_minutos = max(0, int(round(duracao_min * (pct_supervisor / 100.0))))
       pilotos_minutos = duracao_min - sup_minutos
 
-      pilotos_candidatos = pilotos_embaralhados.copy()
-      random.shuffle(pilotos_candidatos)
-      pilotos_ordenados = sorted(
-          pilotos_candidatos, key=lambda p: (horas_do_dia[p], random.random())
-      )
+      def prioridade_piloto(p):
+        habilitado = 0 if rov in preferencia_rov_m2.get(p, []) else 1
+        eh_ex = 0 if p in extras else 1
+        cruzamento = 0
+        if (
+            len(rovs_operados_por_piloto[p]) > 0
+            and rov not in rovs_operados_por_piloto[p]
+        ):
+          cruzamento = 0 if p in extras else 1
+        return (habilitado, cruzamento, horas_do_dia[p], eh_ex, random.random())
+
+      pilotos_ordenados = sorted(pilotos, key=prioridade_piloto)
 
       qtd_pilotos_no_mergulho = min(len(pilotos), 3 if len(pilotos) >= 5 else 2)
       pilotos_disponiveis = []
@@ -485,6 +584,9 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
         cursor_tempo = b_fim
 
         agenda_ocupacao[colaborador].append((b_inicio, b_fim))
+        if cargo == "Piloto":
+          rovs_operados_por_piloto[colaborador].add(rov)
+
         hrs = round(dur_m / 60.0, 2)
         horas_do_dia[colaborador] += hrs
 
