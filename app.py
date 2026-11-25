@@ -42,6 +42,17 @@ def parse_lista_mergulhos_texto(texto_celula):
     return resultado
 
 
+def obter_limites_turno(data_base_str: str, shift_noite: bool):
+    base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
+    if not shift_noite:
+        limite_inicio = base_dt.replace(hour=6, minute=0)
+        limite_fim = base_dt.replace(hour=18, minute=0)
+    else:
+        limite_inicio = base_dt.replace(hour=18, minute=0)
+        limite_fim = base_dt.replace(hour=6, minute=0) + timedelta(days=1)
+    return limite_inicio, limite_fim
+
+
 def parse_horario_turno(horastr: str, datastr: str, shift_noite: bool) -> datetime:
     dt = datetime.strptime(f"{datastr} {horastr}", "%Y-%m-%d %H:%M")
     if shift_noite and dt.hour < 12:
@@ -52,14 +63,7 @@ def parse_horario_turno(horastr: str, datastr: str, shift_noite: bool) -> dateti
 def aplicar_limite_turno(
     dt_i: datetime, dt_f: datetime, data_base_str: str, shift_noite: bool
 ):
-    base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
-    if not shift_noite:
-        limite_inicio = base_dt.replace(hour=6, minute=0)
-        limite_fim = base_dt.replace(hour=18, minute=0)
-    else:
-        limite_inicio = base_dt.replace(hour=18, minute=0)
-        limite_fim = base_dt.replace(hour=6, minute=0) + timedelta(days=1)
-
+    limite_inicio, limite_fim = obter_limites_turno(data_base_str, shift_noite)
     eff_start = max(dt_i, limite_inicio)
     eff_end = min(dt_f, limite_fim)
 
@@ -144,7 +148,8 @@ def gerar_excel_bytes(df):
     return output.getvalue()
 
 
-def calcular_tempo_total_rov(mergulhos_str, data_base_str, shift_noite, shift_start):
+def calcular_tempo_total_rov(mergulhos_str, data_base_str, shift_noite):
+    limite_inicio, limite_fim = obter_limites_turno(data_base_str, shift_noite)
     total_minutos = 0
     primeiros_inicios = []
     for i, f in mergulhos_str:
@@ -159,8 +164,64 @@ def calcular_tempo_total_rov(mergulhos_str, data_base_str, shift_noite, shift_st
             total_minutos += duracao
             primeiros_inicios.append(s)
 
-    inicio_base = min(primeiros_inicios) if primeiros_inicios else shift_start
+    max_duracao_turno = int((limite_fim - limite_inicio).total_seconds() / 60)
+    total_minutos = min(total_minutos, max_duracao_turno)
+
+    inicio_base = min(primeiros_inicios) if primeiros_inicios else limite_inicio
+    # Garante que o bloco consolidado caiba integralmente dentro do limite do turno
+    ultimo_inicio_possivel = limite_fim - timedelta(minutes=total_minutos)
+    if inicio_base > ultimo_inicio_possivel:
+        inicio_base = max(limite_inicio, ultimo_inicio_possivel)
+
     return total_minutos, inicio_base
+
+
+def encontrar_janela_no_turno(
+    agenda_pessoa, inicio_preferido, duracao_min, limite_inicio, limite_fim
+):
+    """
+    Encontra um intervalo [b_inicio, b_fim] de 'duracao_min' minutos estritamente
+    dentro de [limite_inicio, limite_fim] sem sobrepor intervalos já ocupados
+    em 'agenda_pessoa'.
+    """
+    dur_td = timedelta(minutes=duracao_min)
+    ultimo_inicio_valido = limite_fim - dur_td
+    if ultimo_inicio_valido < limite_inicio:
+        ultimo_inicio_valido = limite_inicio
+
+    def livre(s, e):
+        if s < limite_inicio or e > limite_fim:
+            return False
+        for os, oe in agenda_pessoa:
+            if max(s, os) < min(e, oe):
+                return False
+        return True
+
+    # 1. Tenta o início preferido ajustado aos limites do turno
+    cand = max(limite_inicio, min(inicio_preferido, ultimo_inicio_valido))
+    if livre(cand, cand + dur_td):
+        return cand, cand + dur_td
+
+    # 2. Gera pontos candidatos: limites e extremidades de blocos já ocupados
+    pontos_candidatos = [limite_inicio, ultimo_inicio_valido]
+    for os, oe in agenda_pessoa:
+        pontos_candidatos.append(oe)
+        pontos_candidatos.append(os - dur_td)
+
+    pontos_validos = sorted(
+        set(
+            max(limite_inicio, min(p, ultimo_inicio_valido))
+            for p in pontos_candidatos
+        ),
+        key=lambda p: abs((p - cand).total_seconds()),
+    )
+
+    for p in pontos_validos:
+        if livre(p, p + dur_td):
+            return p, p + dur_td
+
+    # 3. Fallback garantido dentro dos limites do turno
+    return cand, min(limite_fim, cand + dur_td)
 
 
 def processar_um_dia(
@@ -180,8 +241,7 @@ def processar_um_dia(
     pct_pilotos_cust,
     pct_extra_dia=None,
 ):
-    base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
-    shift_start = base_dt.replace(hour=18 if shift_noite else 6, minute=0)
+    limite_inicio, limite_fim = obter_limites_turno(data_base_str, shift_noite)
     supervisores = {"UHD68": s_68, "UHD69": s_69}
 
     titulares = [
@@ -200,10 +260,10 @@ def processar_um_dia(
 
     if modo_unico:
         minutos_68, inicio_68 = calcular_tempo_total_rov(
-            mergulhos_68_inputs, data_base_str, shift_noite, shift_start
+            mergulhos_68_inputs, data_base_str, shift_noite
         )
         minutos_69, inicio_69 = calcular_tempo_total_rov(
-            mergulhos_69_inputs, data_base_str, shift_noite, shift_start
+            mergulhos_69_inputs, data_base_str, shift_noite
         )
 
         rov_configs = [
@@ -223,7 +283,7 @@ def processar_um_dia(
             total_pool_pilotos += p_min
 
             if sup_min > 0:
-                b_fim_sup = dt_start + timedelta(minutes=sup_min)
+                b_fim_sup = min(limite_fim, dt_start + timedelta(minutes=sup_min))
                 hrs_sup = round(sup_min / 60.0, 2)
                 horas_dia[sup_fixo] += hrs_sup
                 registros.append({
@@ -284,19 +344,15 @@ def processar_um_dia(
                 for p in pilotos_ativos_dia:
                     rovs_permitidos[p] = rovs_ativos.copy()
 
-        ordem_pilotos = [p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) == 1]
-        random.shuffle(ordem_pilotos)
+        # Aloca primeiro pilotos que operam nos 2 ROVs (piloto extra), garantindo
+        # encaixe sequencial no início do turno sem estourar o limite final
         pilotos_ponte = [p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) > 1]
         random.shuffle(pilotos_ponte)
-        fila_pilotos = ordem_pilotos + pilotos_ponte
+        ordem_pilotos = [p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) == 1]
+        random.shuffle(ordem_pilotos)
+        fila_pilotos = pilotos_ponte + ordem_pilotos
 
         agenda_pilotos = {p: [] for p in pilotos_ativos_dia}
-
-        def tem_conflito_horario(pessoa, s, e):
-            for os, oe in agenda_pilotos[pessoa]:
-                if max(s, os) < min(e, oe):
-                    return True
-            return False
 
         for p in fila_pilotos:
             necessario = metas_pilotos.get(p, 0)
@@ -318,16 +374,18 @@ def processar_um_dia(
                     continue
 
                 alocado = min(necessario, disponivel)
-                b_inicio = pool["cursor"]
-                b_fim = b_inicio + timedelta(minutes=alocado)
+                b_inicio, b_fim = encontrar_janela_no_turno(
+                    agenda_pilotos[p],
+                    pool["cursor"],
+                    alocado,
+                    limite_inicio,
+                    limite_fim,
+                )
 
-                if tem_conflito_horario(p, b_inicio, b_fim):
-                    ultimo_fim = max(e for _, e in agenda_pilotos[p])
-                    if ultimo_fim > b_inicio:
-                        b_inicio = ultimo_fim
-                        b_fim = b_inicio + timedelta(minutes=alocado)
-
-                pool["cursor"] = b_fim
+                novo_cursor = pool["cursor"] + timedelta(minutes=alocado)
+                if novo_cursor > limite_fim:
+                    novo_cursor = limite_fim
+                pool["cursor"] = novo_cursor
                 pool["p_min_restante"] -= alocado
                 necessario -= alocado
                 agenda_pilotos[p].append((b_inicio, b_fim))
@@ -466,15 +524,18 @@ def processar_um_dia(
             for colaborador, dur_m, cargo in slots:
                 if dur_m <= 0:
                     continue
-                b_inicio = cursor_tempo
-                b_fim = cursor_tempo + timedelta(minutes=dur_m)
+                b_inicio = max(limite_inicio, cursor_tempo)
+                b_fim = min(limite_fim, b_inicio + timedelta(minutes=dur_m))
                 cursor_tempo = b_fim
+                dur_efetiva = int((b_fim - b_inicio).total_seconds() / 60)
+                if dur_efetiva <= 0:
+                    continue
 
                 agenda_ocupacao[colaborador].append((b_inicio, b_fim))
                 if cargo == "Piloto":
                     rovs_operados_por_piloto[colaborador].add(rov)
 
-                hrs = round(dur_m / 60.0, 2)
+                hrs = round(dur_efetiva / 60.0, 2)
                 horas_dia[colaborador] += hrs
 
                 registros.append({
@@ -489,7 +550,7 @@ def processar_um_dia(
                     "ROV Alocado": rov,
                     "Início Lançamento": b_inicio.strftime("%H:%M"),
                     "Fim Lançamento": b_fim.strftime("%H:%M"),
-                    "Duração (min)": dur_m,
+                    "Duração (min)": dur_efetiva,
                     "Total Horas (h)": hrs,
                 })
 
@@ -636,18 +697,49 @@ tipo_divisao_pilotos = st.sidebar.radio(
 )
 
 pct_pilotos_custom = {}
+soma_pct_pilotos = 100.0
+excede_100_pct = False
+
 if tipo_divisao_pilotos == "Personalizada por Piloto (%)":
-    st.sidebar.markdown("**Defina a porcentagem/peso de cada piloto:**")
+    st.sidebar.markdown("**Defina a porcentagem de cada piloto (Máx. 100% no total):**")
     val_padrao = round(100.0 / len(pilotos), 1) if pilotos else 25.0
+
+    valores_atuais = {}
     for p in pilotos:
-        pct_pilotos_custom[p] = st.sidebar.number_input(
-            f"% para {p}",
+        k = f"pct_{p}"
+        valores_atuais[p] = float(st.session_state.get(k, val_padrao))
+
+    for p in pilotos:
+        k = f"pct_{p}"
+        soma_outros = sum(v for nome_p, v in valores_atuais.items() if nome_p != p)
+        max_permitido = max(0.0, round(100.0 - soma_outros, 1))
+        valor_inicial = min(valores_atuais[p], max_permitido)
+
+        novo_val = st.sidebar.number_input(
+            f"% para {p} (disponível: {max_permitido:.1f}%)",
             min_value=0.0,
-            max_value=100.0,
-            value=val_padrao,
+            max_value=max_permitido,
+            value=valor_inicial,
             step=1.0,
-            key=f"pct_{p}",
+            key=k,
         )
+        pct_pilotos_custom[p] = novo_val
+        valores_atuais[p] = novo_val
+
+    soma_pct_pilotos = round(sum(pct_pilotos_custom.values()), 1)
+    restante_pct = round(100.0 - soma_pct_pilotos, 1)
+
+    if soma_pct_pilotos > 100.0:
+        excede_100_pct = True
+        st.sidebar.error(
+            f"🚫 Soma das porcentagens está em **{soma_pct_pilotos:.1f}%** (limite máximo: 100%)."
+        )
+    elif soma_pct_pilotos < 100.0:
+        st.sidebar.warning(
+            f"⚠️ Total alocado: **{soma_pct_pilotos:.1f}%** (faltam **{restante_pct:.1f}%** para fechar 100%)."
+        )
+    else:
+        st.sidebar.success("✅ Total alocado: **100.0%** (Exato)")
 
 # =============================================================================
 # TELA 1: LANÇAMENTO DIÁRIO (INDIVIDUAL)
@@ -693,6 +785,13 @@ if st.session_state["tela_ativa"] == "individual":
     if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
         if not pilotos:
             st.error("⚠️ Adicione pelo menos 1 piloto na barra lateral antes de gerar.")
+            st.stop()
+
+        if excede_100_pct:
+            st.error(
+                f"🚫 A soma das porcentagens dos pilotos está em {soma_pct_pilotos:.1f}%. "
+                "Ajuste na barra lateral para não ultrapassar 100%."
+            )
             st.stop()
 
         data_base_str = data_logbook.strftime("%Y-%m-%d")
@@ -862,7 +961,7 @@ else:
                 format="%.1f%%",
                 help=(
                     "Porcentagem do tempo líquido de pilotos destinada ao(s)"
-                    " piloto(s) extra(s) neste dia."
+                    " piloto(s) extra(s) neste dia (0% a 100%)."
                 ),
             ),
         },
@@ -872,6 +971,13 @@ else:
     if st.button("🚀 Gerar Todos os Lançamentos em Massa", type="primary"):
         if not pilotos:
             st.error("⚠️ Adicione pelo menos 1 piloto na barra lateral antes de gerar.")
+            st.stop()
+
+        if excede_100_pct:
+            st.error(
+                f"🚫 A soma das porcentagens dos pilotos está em {soma_pct_pilotos:.1f}%. "
+                "Ajuste na barra lateral para não ultrapassar 100%."
+            )
             st.stop()
 
         todos_registros = []
@@ -915,6 +1021,7 @@ else:
                 try:
                     raw_val = row.get("% Piloto Extra", pct_extra_sugerido)
                     pct_ex_val = float(raw_val) if pd.notna(raw_val) else pct_extra_sugerido
+                    pct_ex_val = max(0.0, min(100.0, pct_ex_val))
                 except (ValueError, TypeError):
                     pct_ex_val = pct_extra_sugerido
 
