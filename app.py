@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import io
 import random
 import openpyxl
 import pandas as pd
@@ -143,17 +144,23 @@ with col2:
   m_69_2 = st.text_input("Mergulho 2", padrao_69[1], key="d69_2")
   m_69_3 = st.text_input("Mergulho 3", padrao_69[2], key="d69_3")
   m_69_4 = st.text_input("Mergulho 4", padrao_69[3], key="d69_4")
-  m_69_5 = st.text_input(
-      "Mergulho 5", padrao_69[4] if len(padrao_69) > 4 else "", key="d69_5"
-  )
+  m_69_5 = st.text_input("Mergulho 5", padrao_69[4], key="d69_5")
 
 
 def extrair_horario(texto):
-  if "-" in texto:
-    partes = texto.split("-")
-    i, f = partes[0].strip(), partes[1].strip()
-    if len(i) == 5 and len(f) == 5:
+  if not texto or "-" not in texto:
+    return None
+  partes = texto.split("-")
+  if len(partes) != 2:
+    return None
+  i, f = partes[0].strip(), partes[1].strip()
+  if len(i) == 5 and len(f) == 5 and ":" in i and ":" in f:
+    try:
+      datetime.strptime(i, "%H:%M")
+      datetime.strptime(f, "%H:%M")
       return (i, f)
+    except ValueError:
+      return None
   return None
 
 
@@ -201,7 +208,7 @@ def calcular_metas_pilotos(
     restante = total_minutos_disponiveis
     for idx in range(n_p - 1):
       bloco = int(round(total_minutos_disponiveis * (weights[idx] / total_w)))
-      bloco = max(5, min(restante - 5 * (n_p - 1 - idx), bloco))
+      bloco = max(0, min(restante, bloco))
       fatias.append(bloco)
       restante -= bloco
     fatias.append(restante)
@@ -218,8 +225,21 @@ def calcular_metas_pilotos(
     return {pilotos_lista[i]: fatias[i] for i in range(n_p)}
 
 
+def gerar_excel_bytes(df):
+  output = io.BytesIO()
+  with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name="Logbook")
+  return output.getvalue()
+
+
 # --- PROCESSAMENTO DO LOGBOOK ---
 if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
+  if not pilotos:
+    st.error(
+        "⚠️ Adicione pelo menos 1 piloto na barra lateral antes de gerar."
+    )
+    st.stop()
+
   data_base_str = data_logbook.strftime("%Y-%m-%d")
   base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
   shift_start = base_dt.replace(hour=18 if is_turno_noite else 6, minute=0)
@@ -239,6 +259,13 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
       for m in [m_69_1, m_69_2, m_69_3, m_69_4, m_69_5]
       if extrair_horario(m)
   ]
+
+  if not mergulhos_68_inputs and not mergulhos_69_inputs:
+    st.warning(
+        "⚠️ Nenhum horário de mergulho válido foi encontrado. Preencha no"
+        " formato HH:MM - HH:MM (ex: 06:30 - 11:00)."
+    )
+    st.stop()
 
   registros = []
   horas_do_dia = {p: 0.0 for p in [sup_68, sup_69] + pilotos}
@@ -267,3 +294,261 @@ if st.button("🚀 Gerar Lançamentos do Logbook", type="primary"):
       return total_minutos, inicio_base
 
     minutos_68, inicio_68 = calcular_tempo_total_rov(mergulhos_68_inputs)
+    minutos_69, inicio_69 = calcular_tempo_total_rov(mergulhos_69_inputs)
+
+    rov_configs = [
+        ("UHD68", minutos_68, sup_68, inicio_68),
+        ("UHD69", minutos_69, sup_69, inicio_69),
+    ]
+
+    rov_pools = {}
+    total_pool_pilotos = 0
+
+    for rov, tot_min, sup_fixo, dt_start in rov_configs:
+      if tot_min <= 0:
+        continue
+
+      sup_min = max(0, int(round(tot_min * (pct_supervisor / 100.0))))
+      p_min = tot_min - sup_min
+      total_pool_pilotos += p_min
+
+      if sup_min > 0:
+        b_fim_sup = dt_start + timedelta(minutes=sup_min)
+        hrs_sup = round(sup_min / 60.0, 2)
+        horas_do_dia[sup_fixo] += hrs_sup
+        registros.append({
+            "Campo": campo_embarcacao,
+            "Operação": nome_operacao,
+            "Data Lançamento": data_base_str,
+            "Data Real (Log)": dt_start.strftime("%Y-%m-%d"),
+            "Turno": "Noite" if is_turno_noite else "Dia",
+            "Modo": "Lançamento Único",
+            "Colaborador": sup_fixo,
+            "Cargo": "Supervisor",
+            "ROV Alocado": rov,
+            "Início Lançamento": dt_start.strftime("%H:%M"),
+            "Fim Lançamento": b_fim_sup.strftime("%H:%M"),
+            "Duração (min)": sup_min,
+            "Total Horas (h)": hrs_sup,
+        })
+
+      rov_pools[rov] = {
+          "p_min_restante": p_min,
+          "cursor": dt_start + timedelta(minutes=sup_min),
+      }
+
+    metas_pilotos = calcular_metas_pilotos(
+        pilotos_embaralhados, total_pool_pilotos, pct_pilotos_custom
+    )
+
+    agenda_pilotos = {p: [] for p in pilotos_embaralhados}
+
+    def tem_conflito_horario(pessoa, s, e):
+      for os, oe in agenda_pilotos[pessoa]:
+        if max(s, os) < min(e, oe):
+          return True
+      return False
+
+    rovs_ativos = sorted(rov_pools.keys(), key=lambda r: rov_pools[r]["cursor"])
+
+    for p in pilotos_embaralhados:
+      necessario = metas_pilotos[p]
+      if necessario <= 0:
+        continue
+
+      for rov in rovs_ativos:
+        if necessario <= 0:
+          break
+        pool = rov_pools[rov]
+        disponivel = pool["p_min_restante"]
+        if disponivel <= 0:
+          continue
+
+        alocado = min(necessario, disponivel)
+        b_inicio = pool["cursor"]
+        b_fim = b_inicio + timedelta(minutes=alocado)
+
+        if tem_conflito_horario(p, b_inicio, b_fim):
+          ultimo_fim = max(e for _, e in agenda_pilotos[p])
+          if ultimo_fim > b_inicio:
+            b_inicio = ultimo_fim
+            b_fim = b_inicio + timedelta(minutes=alocado)
+
+        pool["cursor"] = b_fim
+        pool["p_min_restante"] -= alocado
+        necessario -= alocado
+        agenda_pilotos[p].append((b_inicio, b_fim))
+
+        hrs = round(alocado / 60.0, 2)
+        horas_do_dia[p] += hrs
+
+        registros.append({
+            "Campo": campo_embarcacao,
+            "Operação": nome_operacao,
+            "Data Lançamento": data_base_str,
+            "Data Real (Log)": b_inicio.strftime("%Y-%m-%d"),
+            "Turno": "Noite" if is_turno_noite else "Dia",
+            "Modo": "Lançamento Único",
+            "Colaborador": p,
+            "Cargo": "Piloto",
+            "ROV Alocado": rov,
+            "Início Lançamento": b_inicio.strftime("%H:%M"),
+            "Fim Lançamento": b_fim.strftime("%H:%M"),
+            "Duração (min)": alocado,
+            "Total Horas (h)": hrs,
+        })
+
+  # =========================================================================
+  # MODO 2: HORÁRIOS EXATOS DOS MERGULHOS (MÚLTIPLOS LANÇAMENTOS)
+  # =========================================================================
+  else:
+    lista_mergulhos = []
+    for i, f in mergulhos_68_inputs:
+      dt_i = parse_horario_turno(i, data_base_str, is_turno_noite)
+      dt_f = parse_horario_turno(f, data_base_str, is_turno_noite)
+      if dt_f <= dt_i:
+        dt_f += timedelta(days=1)
+      s, e = aplicar_limite_turno(dt_i, dt_f, data_base_str, is_turno_noite)
+      if s and e:
+        lista_mergulhos.append(("UHD68", s, e))
+
+    for i, f in mergulhos_69_inputs:
+      dt_i = parse_horario_turno(i, data_base_str, is_turno_noite)
+      dt_f = parse_horario_turno(f, data_base_str, is_turno_noite)
+      if dt_f <= dt_i:
+        dt_f += timedelta(days=1)
+      s, e = aplicar_limite_turno(dt_i, dt_f, data_base_str, is_turno_noite)
+      if s and e:
+        lista_mergulhos.append(("UHD69", s, e))
+
+    lista_mergulhos.sort(key=lambda m: m[1])
+
+    agenda_ocupacao = {p: [] for p in horas_do_dia.keys()}
+
+    def tem_conflito(pessoa, inicio, fim):
+      for s, e in agenda_ocupacao[pessoa]:
+        if max(inicio, s) < min(fim, e):
+          return True
+      return False
+
+    for rov, dt_inicio, dt_fim in lista_mergulhos:
+      duracao_min = int((dt_fim - dt_inicio).total_seconds() / 60)
+      sup_fixo = supervisores[rov]
+
+      sup_minutos = max(0, int(round(duracao_min * (pct_supervisor / 100.0))))
+      pilotos_minutos = duracao_min - sup_minutos
+
+      pilotos_candidatos = pilotos_embaralhados.copy()
+      random.shuffle(pilotos_candidatos)
+      pilotos_ordenados = sorted(
+          pilotos_candidatos, key=lambda p: (horas_do_dia[p], random.random())
+      )
+
+      qtd_pilotos_no_mergulho = min(len(pilotos), 3 if len(pilotos) >= 5 else 2)
+      pilotos_disponiveis = []
+      for p in pilotos_ordenados:
+        if len(pilotos_disponiveis) >= qtd_pilotos_no_mergulho:
+          break
+        if not tem_conflito(p, dt_inicio, dt_fim):
+          pilotos_disponiveis.append(p)
+
+      if not pilotos_disponiveis:
+        pilotos_disponiveis = [pilotos_ordenados[0]]
+
+      metas_bloco = calcular_metas_pilotos(
+          pilotos_disponiveis, pilotos_minutos, pct_pilotos_custom
+      )
+      fatias_pilotos = [metas_bloco[p] for p in pilotos_disponiveis]
+
+      slots = []
+      sup_dt_s = dt_inicio
+      sup_dt_e = dt_inicio + timedelta(minutes=sup_minutos)
+
+      if sup_minutos > 0 and not tem_conflito(sup_fixo, sup_dt_s, sup_dt_e):
+        slots.append((sup_fixo, sup_minutos, "Supervisor"))
+      else:
+        pilotos_minutos = duracao_min
+        metas_bloco = calcular_metas_pilotos(
+            pilotos_disponiveis, pilotos_minutos, pct_pilotos_custom
+        )
+        fatias_pilotos = [metas_bloco[p] for p in pilotos_disponiveis]
+
+      for idx, p in enumerate(pilotos_disponiveis):
+        slots.append((p, fatias_pilotos[idx], "Piloto"))
+
+      cursor_tempo = dt_inicio
+      for colaborador, dur_m, cargo in slots:
+        if dur_m <= 0:
+          continue
+        b_inicio = cursor_tempo
+        b_fim = cursor_tempo + timedelta(minutes=dur_m)
+        cursor_tempo = b_fim
+
+        agenda_ocupacao[colaborador].append((b_inicio, b_fim))
+        hrs = round(dur_m / 60.0, 2)
+        horas_do_dia[colaborador] += hrs
+
+        registros.append({
+            "Campo": campo_embarcacao,
+            "Operação": nome_operacao,
+            "Data Lançamento": data_base_str,
+            "Data Real (Log)": b_inicio.strftime("%Y-%m-%d"),
+            "Turno": "Noite" if is_turno_noite else "Dia",
+            "Modo": "Horários Exatos",
+            "Colaborador": colaborador,
+            "Cargo": cargo,
+            "ROV Alocado": rov,
+            "Início Lançamento": b_inicio.strftime("%H:%M"),
+            "Fim Lançamento": b_fim.strftime("%H:%M"),
+            "Duração (min)": dur_m,
+            "Total Horas (h)": hrs,
+        })
+
+  if registros:
+    df_completo = pd.DataFrame(registros)
+
+    colunas_visiveis = [
+        "Campo",
+        "Operação",
+        "Data Real (Log)",
+        "Colaborador",
+        "ROV Alocado",
+        "Início Lançamento",
+        "Fim Lançamento",
+        "Total Horas (h)",
+    ]
+
+    df_exibicao = df_completo[colunas_visiveis]
+
+    st.session_state["df_exibicao"] = df_exibicao
+    st.session_state["horas_do_dia"] = horas_do_dia
+    st.session_state["data_base_str"] = data_base_str
+  else:
+    st.warning(
+        "⚠️ Nenhum lançamento válido foi gerado dentro do horário do turno"
+        " selecionado."
+    )
+
+# --- EXIBIÇÃO DOS RESULTADOS E DOWNLOAD DA PLANILHA ---
+if "df_exibicao" in st.session_state:
+  df_exibicao = st.session_state["df_exibicao"]
+  horas_do_dia = st.session_state["horas_do_dia"]
+  data_base_str = st.session_state["data_base_str"]
+
+  st.success("✅ Tabela do Logbook Gerada!")
+  st.dataframe(df_exibicao, use_container_width=True)
+
+  excel_bytes = gerar_excel_bytes(df_exibicao)
+  st.download_button(
+      label="📥 Baixar Planilha Excel (.xlsx)",
+      data=excel_bytes,
+      file_name=f"Logbook_ROV_{data_base_str}.xlsx",
+      mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      type="primary",
+  )
+
+  st.subheader("📊 Resumo de Horas do Turno (Verificação de Igualdade)")
+  df_saldos = pd.DataFrame(
+      list(horas_do_dia.items()), columns=["Colaborador", "Total Horas no Dia (h)"]
+  )
+  st.dataframe(df_saldos, use_container_width=True)
