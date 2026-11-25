@@ -13,7 +13,7 @@ st.title("⚓ Sistema de Lançamento de Horários ROV")
 st.markdown(
     "Escolha entre **Lançamento Único (Consolidado)** ou **Horários Exatos"
     " (Múltiplos Lançamentos)**, com modo individual ou **Lançamento em Massa"
-    " (Vários Dias)** seguindo as mesmas configurações da equipe."
+    " (Vários Dias)** permitindo variar a porcentagem diária do piloto extra."
 )
 
 # --- CONTROLE DE NAVEGAÇÃO ENTRE ABAS / TELAS ---
@@ -189,7 +189,6 @@ def extrair_horario(texto):
 
 
 def parse_lista_mergulhos_texto(texto_celula):
-  """Aceita vários mergulhos separados por vírgula ou ponto e vírgula."""
   if not texto_celula or not isinstance(texto_celula, str):
     return []
   blocos = texto_celula.replace(";", ",").split(",")
@@ -229,13 +228,65 @@ def aplicar_limite_turno(
   return None, None
 
 
+def eh_piloto_extra(nome_p, idx_original):
+  return idx_original >= 4 or "extra" in nome_p.lower()
+
+
 def calcular_metas_pilotos(
-    pilotos_lista, total_minutos_disponiveis, custom_pcts
+    pilotos_lista,
+    total_minutos_disponiveis,
+    custom_pcts,
+    pct_extra_dia=None,
+    lista_extras_turno=None,
 ):
+  """
+    Calcula a cota de minutos de cada piloto.
+    - Se `pct_extra_dia` for informado (ex: 10% ou 25% no lançamento em massa),
+      reserva exatamente essa porcentagem do tempo de pilotos para o(s) piloto(s) extra(s)
+      presentes no bloco e divide o restante igualitariamente entre os titulares.
+    """
   n_p = len(pilotos_lista)
   if n_p == 0 or total_minutos_disponiveis <= 0:
     return {p: 0 for p in pilotos_lista}
 
+  # Caso 1: Porcentagem diária específica para Piloto Extra (Lançamento em Massa)
+  if pct_extra_dia is not None and lista_extras_turno:
+    extras_no_bloco = [p for p in pilotos_lista if p in lista_extras_turno]
+    titulares_no_bloco = [
+        p for p in pilotos_lista if p not in lista_extras_turno
+    ]
+
+    if extras_no_bloco and titulares_no_bloco:
+      pct_efetivo = max(0.0, min(100.0, float(pct_extra_dia)))
+      min_total_extras = int(
+          round(total_minutos_disponiveis * (pct_efetivo / 100.0))
+      )
+      min_total_titulares = total_minutos_disponiveis - min_total_extras
+
+      metas = {}
+      n_ex = len(extras_no_bloco)
+      base_ex = min_total_extras // n_ex
+      sobra_ex = min_total_extras % n_ex
+      for idx, p in enumerate(extras_no_bloco):
+        metas[p] = base_ex + (1 if idx < sobra_ex else 0)
+
+      n_tit = len(titulares_no_bloco)
+      base_tit = min_total_titulares // n_tit
+      sobra_tit = min_total_titulares % n_tit
+      fatias_tit = [
+          base_tit + (1 if idx < sobra_tit else 0) for idx in range(n_tit)
+      ]
+      if n_tit >= 2 and base_tit > 20:
+        for i in range(0, n_tit - 1, 2):
+          jitter = random.randint(-2, 2)
+          fatias_tit[i] += jitter
+          fatias_tit[i + 1] -= jitter
+      for idx, p in enumerate(titulares_no_bloco):
+        metas[p] = fatias_tit[idx]
+
+      return metas
+
+  # Caso 2: Porcentagem customizada fixa por piloto (Sidebar)
   if custom_pcts and any(custom_pcts.get(p, 0) > 0 for p in pilotos_lista):
     weights = [custom_pcts.get(p, 1.0) for p in pilotos_lista]
     total_w = sum(weights) if sum(weights) > 0 else 1.0
@@ -248,20 +299,17 @@ def calcular_metas_pilotos(
       restante -= bloco
     fatias.append(restante)
     return {pilotos_lista[i]: fatias[i] for i in range(n_p)}
-  else:
-    base_p = total_minutos_disponiveis // n_p
-    sobra = total_minutos_disponiveis % n_p
-    fatias = [base_p + (1 if i < sobra else 0) for i in range(n_p)]
-    if n_p >= 2 and base_p > 20:
-      for i in range(0, n_p - 1, 2):
-        jitter = random.randint(-3, 3)
-        fatias[i] += jitter
-        fatias[i + 1] -= jitter
-    return {pilotos_lista[i]: fatias[i] for i in range(n_p)}
 
-
-def eh_piloto_extra(nome_p, idx_original):
-  return idx_original >= 4 or "extra" in nome_p.lower()
+  # Caso 3: Divisão igualitária padrão entre todos
+  base_p = total_minutos_disponiveis // n_p
+  sobra = total_minutos_disponiveis % n_p
+  fatias = [base_p + (1 if i < sobra else 0) for i in range(n_p)]
+  if n_p >= 2 and base_p > 20:
+    for i in range(0, n_p - 1, 2):
+      jitter = random.randint(-3, 3)
+      fatias[i] += jitter
+      fatias[i + 1] -= jitter
+  return {pilotos_lista[i]: fatias[i] for i in range(n_p)}
 
 
 def gerar_excel_bytes(df):
@@ -286,6 +334,7 @@ def processar_um_dia(
     alloc_man,
     pct_sup,
     pct_pilotos_cust,
+    pct_extra_dia=None,
 ):
   base_dt = datetime.strptime(data_base_str, "%Y-%m-%d")
   shift_start = base_dt.replace(hour=18 if shift_noite else 6, minute=0)
@@ -295,6 +344,11 @@ def processar_um_dia(
       p for idx, p in enumerate(lista_pilotos) if not eh_piloto_extra(p, idx)
   ]
   extras = [p for idx, p in enumerate(lista_pilotos) if eh_piloto_extra(p, idx)]
+
+  # Se no dia específico a porcentagem do extra for 0%, remove o extra da escala daquele dia
+  pilotos_ativos_dia = lista_pilotos.copy()
+  if pct_extra_dia is not None and float(pct_extra_dia) <= 0.0 and extras:
+    pilotos_ativos_dia = [p for p in lista_pilotos if p not in extras]
 
   registros = []
   horas_dia = {p: 0.0 for p in [s_68, s_69] + lista_pilotos}
@@ -365,12 +419,16 @@ def processar_um_dia(
 
     rovs_ativos = sorted(rov_pools.keys(), key=lambda r: rov_pools[r]["cursor"])
     metas_pilotos = calcular_metas_pilotos(
-        lista_pilotos, total_pool_pilotos, pct_pilotos_cust
+        pilotos_ativos_dia,
+        total_pool_pilotos,
+        pct_pilotos_cust,
+        pct_extra_dia=pct_extra_dia,
+        lista_extras_turno=extras,
     )
 
     rovs_permitidos = {}
     if modo_alloc.startswith("Manual"):
-      for p in lista_pilotos:
+      for p in pilotos_ativos_dia:
         escolha = alloc_man.get(p, "Ambos (UHD68 e UHD69)")
         if escolha == "UHD68":
           rovs_permitidos[p] = ["UHD68"]
@@ -379,8 +437,8 @@ def processar_um_dia(
         else:
           rovs_permitidos[p] = rovs_ativos.copy()
     else:
-      titulares_emb = titulares.copy()
-      extras_emb = extras.copy()
+      titulares_emb = [p for p in titulares if p in pilotos_ativos_dia]
+      extras_emb = [p for p in extras if p in pilotos_ativos_dia]
       random.shuffle(titulares_emb)
       random.shuffle(extras_emb)
 
@@ -393,16 +451,20 @@ def processar_um_dia(
         for p in extras_emb:
           rovs_permitidos[p] = rovs_ativos.copy()
       else:
-        for p in lista_pilotos:
+        for p in pilotos_ativos_dia:
           rovs_permitidos[p] = rovs_ativos.copy()
 
-    ordem_pilotos = [p for p in lista_pilotos if len(rovs_permitidos[p]) == 1]
+    ordem_pilotos = [
+        p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) == 1
+    ]
     random.shuffle(ordem_pilotos)
-    pilotos_ponte = [p for p in lista_pilotos if len(rovs_permitidos[p]) > 1]
+    pilotos_ponte = [
+        p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) > 1
+    ]
     random.shuffle(pilotos_ponte)
     fila_pilotos = ordem_pilotos + pilotos_ponte
 
-    agenda_pilotos = {p: [] for p in lista_pilotos}
+    agenda_pilotos = {p: [] for p in pilotos_ativos_dia}
 
     def tem_conflito_horario(pessoa, s, e):
       for os, oe in agenda_pilotos[pessoa]:
@@ -411,7 +473,7 @@ def processar_um_dia(
       return False
 
     for p in fila_pilotos:
-      necessario = metas_pilotos[p]
+      necessario = metas_pilotos.get(p, 0)
       if necessario <= 0:
         continue
 
@@ -486,7 +548,7 @@ def processar_um_dia(
     lista_mergulhos.sort(key=lambda m: m[1])
 
     agenda_ocupacao = {p: [] for p in horas_dia.keys()}
-    rovs_operados_por_piloto = {p: set() for p in lista_pilotos}
+    rovs_operados_por_piloto = {p: set() for p in pilotos_ativos_dia}
 
     def tem_conflito(pessoa, inicio, fim):
       for s, e in agenda_ocupacao[pessoa]:
@@ -496,20 +558,20 @@ def processar_um_dia(
 
     preferencia_rov_m2 = {}
     if modo_alloc.startswith("Manual"):
-      for p in lista_pilotos:
+      for p in pilotos_ativos_dia:
         esc = alloc_man.get(p, "Ambos (UHD68 e UHD69)")
         preferencia_rov_m2[p] = (
             ["UHD68", "UHD69"] if "Ambos" in esc else [esc]
         )
     else:
-      tit_emb = titulares.copy()
+      tit_emb = [p for p in titulares if p in pilotos_ativos_dia]
       random.shuffle(tit_emb)
       meio = (len(tit_emb) + 1) // 2
       for p in tit_emb[:meio]:
         preferencia_rov_m2[p] = ["UHD68"]
       for p in tit_emb[meio:]:
         preferencia_rov_m2[p] = ["UHD69"]
-      for p in extras:
+      for p in [e for e in extras if e in pilotos_ativos_dia]:
         preferencia_rov_m2[p] = ["UHD68", "UHD69"]
 
     for rov, dt_inicio, dt_fim in lista_mergulhos:
@@ -530,10 +592,10 @@ def processar_um_dia(
           cruzamento = 0 if p in extras else 1
         return (habilitado, cruzamento, horas_dia[p], eh_ex, random.random())
 
-      pilotos_ordenados = sorted(lista_pilotos, key=prioridade_piloto)
+      pilotos_ordenados = sorted(pilotos_ativos_dia, key=prioridade_piloto)
 
       qtd_pilotos_no_mergulho = min(
-          len(lista_pilotos), 3 if len(lista_pilotos) >= 5 else 2
+          len(pilotos_ativos_dia), 3 if len(pilotos_ativos_dia) >= 5 else 2
       )
       pilotos_disponiveis = []
       for p in pilotos_ordenados:
@@ -546,7 +608,11 @@ def processar_um_dia(
         pilotos_disponiveis = [pilotos_ordenados[0]]
 
       metas_bloco = calcular_metas_pilotos(
-          pilotos_disponiveis, pilotos_minutos, pct_pilotos_cust
+          pilotos_disponiveis,
+          pilotos_minutos,
+          pct_pilotos_cust,
+          pct_extra_dia=pct_extra_dia,
+          lista_extras_turno=extras,
       )
       fatias_pilotos = [metas_bloco[p] for p in pilotos_disponiveis]
 
@@ -559,7 +625,11 @@ def processar_um_dia(
       else:
         pilotos_minutos = duracao_min
         metas_bloco = calcular_metas_pilotos(
-            pilotos_disponiveis, pilotos_minutos, pct_pilotos_cust
+            pilotos_disponiveis,
+            pilotos_minutos,
+            pct_pilotos_cust,
+            pct_extra_dia=pct_extra_dia,
+            lista_extras_turno=extras,
         )
         fatias_pilotos = [metas_bloco[p] for p in pilotos_disponiveis]
 
@@ -681,6 +751,7 @@ if st.session_state["tela_ativa"] == "individual":
         alocacao_manual,
         pct_supervisor,
         pct_pilotos_custom,
+        pct_extra_dia=None,
     )
 
     if registros:
@@ -735,13 +806,13 @@ if st.session_state["tela_ativa"] == "individual":
 else:
   st.subheader("📚 Lançamento em Massa (Vários Dias Consecutivos)")
   st.markdown(
-      "Configure o **período inicial e a quantidade de dias**. Edite diretamente"
-      " na tabela abaixo os horários de mergulho de cada dia (separe múltiplos"
-      " mergulhos no mesmo dia com vírgula, ex: `06:30 - 11:00, 14:00 -"
-      " 17:30`)."
+      "Configure o **período inicial e a quantidade de dias**. Na coluna"
+      " **% Piloto Extra**, você pode variar a porcentagem diária destinada ao"
+      " piloto extra (ex.: `20` para 20%, `10` para 10%, `0` se não atuar naquele"
+      " dia)."
   )
 
-  c_m1, c_m2 = st.columns(2)
+  c_m1, c_m2, c_m3 = st.columns([2, 2, 3])
   with c_m1:
     data_inicio_massa = st.date_input(
         "Data Inicial do Período", datetime.now(), key="data_ini_massa"
@@ -755,6 +826,15 @@ else:
         step=1,
         key="qtd_dias_massa",
     )
+  with c_m3:
+    usar_pct_extra_diario = st.checkbox(
+        "Variar % do Piloto Extra dia a dia na tabela",
+        value=True,
+        help=(
+            "Quando ativado, usa a coluna '% Piloto Extra' de cada linha para"
+            " calcular a cota do(s) piloto(s) extra(s) naquele dia específico."
+        ),
+    )
 
   padrao_str_68 = (
       "18:00 - 20:00, 02:00 - 06:00"
@@ -765,19 +845,22 @@ else:
       "19:00 - 01:00" if is_turno_noite else "08:00 - 12:30, 15:00 - 18:00"
   )
 
+  pct_extra_sugerido = round(100.0 / len(pilotos), 1) if pilotos else 20.0
+
   linhas_grade = []
   for d in range(int(qtd_dias_massa)):
     dt_dia = data_inicio_massa + timedelta(days=d)
     linhas_grade.append({
         "Data": dt_dia.strftime("%Y-%m-%d"),
-        "Operação (Opcional - sobrescreve padrão)": nome_operacao,
+        "Operação": nome_operacao,
         "Mergulhos UHD68": padrao_str_68,
         "Mergulhos UHD69": padrao_str_69,
+        "% Piloto Extra": pct_extra_sugerido,
     })
 
   df_grade_input = pd.DataFrame(linhas_grade)
 
-  st.markdown("#### ✏️ Grade Editável de Horários por Dia")
+  st.markdown("#### ✏️ Grade Editável de Horários e Porcentagem Diária do Extra")
   df_editado = st.data_editor(
       df_grade_input,
       use_container_width=True,
@@ -786,14 +869,23 @@ else:
           "Data": st.column_config.TextColumn(
               "Data (AAAA-MM-DD)", required=True
           ),
-          "Operação (Opcional - sobrescreve padrão)": (
-              st.column_config.TextColumn("Operação")
-          ),
+          "Operação": st.column_config.TextColumn("Operação"),
           "Mergulhos UHD68": st.column_config.TextColumn(
               "Mergulhos UHD68 (HH:MM - HH:MM)"
           ),
           "Mergulhos UHD69": st.column_config.TextColumn(
               "Mergulhos UHD69 (HH:MM - HH:MM)"
+          ),
+          "% Piloto Extra": st.column_config.NumberColumn(
+              "% Piloto Extra",
+              min_value=0.0,
+              max_value=100.0,
+              step=1.0,
+              format="%.1f%%",
+              help=(
+                  "Porcentagem do tempo líquido de pilotos destinada ao(s)"
+                  " piloto(s) extra(s) neste dia."
+              ),
           ),
       },
       key="editor_massa",
@@ -823,9 +915,7 @@ else:
         )
         continue
 
-      op_dia = str(
-          row.get("Operação (Opcional - sobrescreve padrão)", nome_operacao)
-      ).strip()
+      op_dia = str(row.get("Operação", nome_operacao)).strip()
       if not op_dia:
         op_dia = nome_operacao
 
@@ -838,6 +928,16 @@ else:
 
       if not m68_lista and not m69_lista:
         continue
+
+      pct_ex_val = None
+      if usar_pct_extra_diario:
+        try:
+          raw_val = row.get("% Piloto Extra", pct_extra_sugerido)
+          pct_ex_val = (
+              float(raw_val) if pd.notna(raw_val) else pct_extra_sugerido
+          )
+        except (ValueError, TypeError):
+          pct_ex_val = pct_extra_sugerido
 
       regs_dia, hrs_dia = processar_um_dia(
           data_str,
@@ -854,6 +954,7 @@ else:
           alocacao_manual,
           pct_supervisor,
           pct_pilotos_custom,
+          pct_extra_dia=pct_ex_val,
       )
 
       if regs_dia:
