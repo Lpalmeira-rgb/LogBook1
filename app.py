@@ -5,167 +5,9 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(
-    page_title="Sistema de Logbook ROV", page_icon="⚓", layout="wide"
-)
-
-st.title("⚓ Sistema de Lançamento de Horários ROV")
-st.markdown(
-    "Escolha entre **Lançamento Único (Consolidado)** ou **Horários Exatos"
-    " (Múltiplos Lançamentos)**, com modo individual ou **Lançamento em Massa"
-    " (Vários Dias)** permitindo variar a porcentagem diária do piloto extra."
-)
-
-# --- CONTROLE DE NAVEGAÇÃO ENTRE ABAS / TELAS ---
-if "tela_ativa" not in st.session_state:
-    st.session_state["tela_ativa"] = "individual"
-
-col_nav1, col_nav2, _ = st.columns([2, 2, 4])
-with col_nav1:
-    if st.button(
-        "📅 Lançamento Diário (Individual)",
-        type="primary" if st.session_state["tela_ativa"] == "individual" else "secondary",
-        use_container_width=True,
-    ):
-        st.session_state["tela_ativa"] = "individual"
-        st.rerun()
-
-with col_nav2:
-    if st.button(
-        "📚 Lançamento em Massa (Vários Dias)",
-        type="primary" if st.session_state["tela_ativa"] == "massa" else "secondary",
-        use_container_width=True,
-    ):
-        st.session_state["tela_ativa"] = "massa"
-        st.rerun()
-
-st.divider()
-
-# --- SIDEBAR: CONFIGURAÇÕES GERAIS (COMUNS AOS DOIS MODOS) ---
-st.sidebar.header("⚙️ Configurações da Equipe e Regras")
-
-campo_embarcacao = st.sidebar.text_input(
-    "Campo de Atuação da Embarcação", "Campo de Búzios"
-)
-
-nome_operacao = st.sidebar.text_input(
-    "Nome da Operação", "Inspeção Subsea / Intervenção"
-)
-
-turno_selecionado = st.sidebar.selectbox(
-    "Selecione o Turno", ["Dia (06:00 - 18:00)", "Noite (18:00 - 06:00)"]
-)
-
-modo_lancamento = st.sidebar.radio(
-    "Modo de Lançamento por Operador",
-    [
-        "1 - Lançamento Único (Consolidado no Turno)",
-        "Múltiplos - Horários Exatos dos Mergulhos",
-    ],
-    help=(
-        "Escolha '1' para consolidar o tempo do turno com divisão matemática"
-        " exata entre todos os pilotos, ou 'Múltiplos' para dividir cada"
-        " mergulho individualmente."
-    ),
-)
-
-is_turno_noite = "Noite" in turno_selecionado
-is_modo_unico = "1" in modo_lancamento
-
-# --- CADASTRO DA EQUIPE ---
-st.sidebar.subheader("👨‍✈️ Supervisores (Fixos)")
-sup_68 = st.sidebar.text_input("Supervisor UHD68", "Sup. João Silva")
-sup_69 = st.sidebar.text_input("Supervisor UHD69", "Sup. Marcos Rocha")
-
-st.sidebar.subheader("👨‍💻 Pilotos (Equipe Dinâmica)")
-qtd_pilotos = st.sidebar.number_input(
-    "Quantidade de Pilotos no Turno", min_value=1, max_value=12, value=5, step=1
-)
-
-nomes_padrao = [
-    "Piloto Lucas Alves",
-    "Piloto Gabriel Lima",
-    "Piloto Mateus Costa",
-    "Piloto André Santos",
-    "Piloto Extra 1",
-    "Piloto Extra 2",
-    "Piloto Extra 3",
-    "Piloto Extra 4",
-    "Piloto Extra 5",
-    "Piloto Extra 6",
-]
-
-pilotos = []
-for i in range(int(qtd_pilotos)):
-    p_default = nomes_padrao[i] if i < len(nomes_padrao) else f"Piloto {i+1}"
-    label_p = f"Piloto {i+1} (Extra)" if i >= 4 else f"Piloto {i+1}"
-    p_nome = st.sidebar.text_input(label_p, p_default, key=f"piloto_input_{i}")
-    if p_nome.strip():
-        pilotos.append(p_nome.strip())
-
-# --- MODO DE ALOCAÇÃO NOS VEÍCULOS ---
-st.sidebar.subheader("🚤 Alocação nos ROVs")
-modo_alocacao_rov = st.sidebar.radio(
-    "Forma de Alocação dos Pilotos",
-    [
-        "Aleatória (Priorizando Extra nos 2 ROVs)",
-        "Manual (Escolher ROV por Piloto)",
-    ],
-)
-
-alocacao_manual = {}
-if modo_alocacao_rov.startswith("Manual"):
-    st.sidebar.markdown("**Defina o ROV de cada piloto:**")
-    for idx, p in enumerate(pilotos):
-        if idx < 2:
-            idx_padrao = 0
-        elif idx < 4:
-            idx_padrao = 1
-        else:
-            idx_padrao = 2
-        alocacao_manual[p] = st.sidebar.selectbox(
-            f"ROV para {p}",
-            ["UHD68", "UHD69", "Ambos (UHD68 e UHD69)"],
-            index=idx_padrao,
-            key=f"alloc_man_{idx}_{p}",
-        )
-
-# --- AJUSTE DE PORCENTAGENS DE DIVISÃO ---
-st.sidebar.subheader("⚖️ Porcentagens da Divisão")
-
-pct_supervisor = st.sidebar.number_input(
-    "Porcentagem do Supervisor (%)",
-    min_value=0.0,
-    max_value=50.0,
-    value=10.0,
-    step=1.0,
-    help=(
-        "Porcentagem do tempo total de mergulho atribuída ao supervisor fixo."
-    ),
-)
-
-tipo_divisao_pilotos = st.sidebar.radio(
-    "Divisão entre os Pilotos",
-    ["Igualitária (Divisão Equitativa)", "Personalizada por Piloto (%)"],
-)
-
-pct_pilotos_custom = {}
-if tipo_divisao_pilotos == "Personalizada por Piloto (%)":
-    st.sidebar.markdown("**Defina a porcentagem/peso de cada piloto:**")
-    val_padrao = round(100.0 / len(pilotos), 1) if pilotos else 25.0
-    for p in pilotos:
-        pct_pilotos_custom[p] = st.sidebar.number_input(
-            f"% para {p}",
-            min_value=0.0,
-            max_value=100.0,
-            value=val_padrao,
-            step=1.0,
-            key=f"pct_{p}",
-        )
-
 
 # =============================================================================
-# FUNÇÕES DE CÁLCULO REUTILIZÁVEIS (DIA ÚNICO E MASSA)
+# FUNÇÕES AUXILIARES E DE CÁLCULO
 # =============================================================================
 def extrair_horario(texto):
     if not texto or not isinstance(texto, str) or "-" not in texto:
@@ -419,4 +261,68 @@ def processar_um_dia(
                 elif escolha == "UHD69":
                     rovs_permitidos[p] = ["UHD69"]
                 else:
-                    rovs_permitidos[p] = rovs_
+                    rovs_permitidos[p] = rovs_ativos.copy()
+        else:
+            titulares_emb = [p for p in titulares if p in pilotos_ativos_dia]
+            extras_emb = [p for p in extras if p in pilotos_ativos_dia]
+            random.shuffle(titulares_emb)
+            random.shuffle(extras_emb)
+
+            if len(rovs_ativos) == 2:
+                meio = (len(titulares_emb) + 1) // 2
+                for p in titulares_emb[:meio]:
+                    rovs_permitidos[p] = [rovs_ativos[0]]
+                for p in titulares_emb[meio:]:
+                    rovs_permitidos[p] = [rovs_ativos[1]]
+                for p in extras_emb:
+                    rovs_permitidos[p] = rovs_ativos.copy()
+            else:
+                for p in pilotos_ativos_dia:
+                    rovs_permitidos[p] = rovs_ativos.copy()
+
+        ordem_pilotos = [p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) == 1]
+        random.shuffle(ordem_pilotos)
+        pilotos_ponte = [p for p in pilotos_ativos_dia if len(rovs_permitidos[p]) > 1]
+        random.shuffle(pilotos_ponte)
+        fila_pilotos = ordem_pilotos + pilotos_ponte
+
+        agenda_pilotos = {p: [] for p in pilotos_ativos_dia}
+
+        def tem_conflito_horario(pessoa, s, e):
+            for os, oe in agenda_pilotos[pessoa]:
+                if max(s, os) < min(e, oe):
+                    return True
+            return False
+
+        for p in fila_pilotos:
+            necessario = metas_pilotos.get(p, 0)
+            if necessario <= 0:
+                continue
+
+            lista_rovs_tentativa = rovs_permitidos[p] + [
+                r for r in rovs_ativos if r not in rovs_permitidos[p]
+            ]
+
+            for rov in lista_rovs_tentativa:
+                if necessario <= 0:
+                    break
+                if rov not in rov_pools:
+                    continue
+                pool = rov_pools[rov]
+                disponivel = pool["p_min_restante"]
+                if disponivel <= 0:
+                    continue
+
+                alocado = min(necessario, disponivel)
+                b_inicio = pool["cursor"]
+                b_fim = b_inicio + timedelta(minutes=alocado)
+
+                if tem_conflito_horario(p, b_inicio, b_fim):
+                    ultimo_fim = max(e for _, e in agenda_pilotos[p])
+                    if ultimo_fim > b_inicio:
+                        b_inicio = ultimo_fim
+                        b_fim = b_inicio + timedelta(minutes=alocado)
+
+                pool["cursor"] = b_fim
+                pool["p_min_restante"] -= alocado
+                necessario -= al
