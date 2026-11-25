@@ -239,12 +239,6 @@ def calcular_metas_pilotos(
     pct_extra_dia=None,
     lista_extras_turno=None,
 ):
-  """
-    Calcula a cota de minutos de cada piloto.
-    - Se `pct_extra_dia` for informado (ex: 10% ou 25% no lançamento em massa),
-      reserva exatamente essa porcentagem do tempo de pilotos para o(s) piloto(s) extra(s)
-      presentes no bloco e divide o restante igualitariamente entre os titulares.
-    """
   n_p = len(pilotos_lista)
   if n_p == 0 or total_minutos_disponiveis <= 0:
     return {p: 0 for p in pilotos_lista}
@@ -345,7 +339,6 @@ def processar_um_dia(
   ]
   extras = [p for idx, p in enumerate(lista_pilotos) if eh_piloto_extra(p, idx)]
 
-  # Se no dia específico a porcentagem do extra for 0%, remove o extra da escala daquele dia
   pilotos_ativos_dia = lista_pilotos.copy()
   if pct_extra_dia is not None and float(pct_extra_dia) <= 0.0 and extras:
     pilotos_ativos_dia = [p for p in lista_pilotos if p not in extras]
@@ -997,21 +990,51 @@ else:
         f"✅ Lançamento em Massa Concluído! ({dias_proc} dias processados |"
         f" {len(df_massa_exibicao)} linhas geradas)"
     )
-    st.dataframe(df_massa_exibicao, use_container_width=True)
 
-    excel_massa_bytes = gerar_excel_bytes(df_massa_exibicao)
+    # --- FILTRO POR PILOTO / COLABORADOR ---
+    col_f1, col_f2 = st.columns([3, 1])
+    with col_f1:
+      colaboradores_unicos = sorted(
+          df_massa_exibicao["Colaborador"].unique().tolist()
+      )
+      filtro_colaboradores = st.multiselect(
+          "🔍 Filtrar Tabela por Piloto / Colaborador (deixe vazio para ver"
+          " todos):",
+          options=colaboradores_unicos,
+          default=[],
+          key="filtro_piloto_massa",
+      )
+    with col_f2:
+      rovs_unicos = sorted(df_massa_exibicao["ROV Alocado"].unique().tolist())
+      filtro_rov = st.multiselect(
+          "🚤 Filtrar por ROV:",
+          options=rovs_unicos,
+          default=[],
+          key="filtro_rov_massa",
+      )
+
+    df_massa_filtrada = df_massa_exibicao.copy()
+    if filtro_colaboradores:
+      df_massa_filtrada = df_massa_filtrada[
+          df_massa_filtrada["Colaborador"].isin(filtro_colaboradores)
+      ]
+    if filtro_rov:
+      df_massa_filtrada = df_massa_filtrada[
+          df_massa_filtrada["ROV Alocado"].isin(filtro_rov)
+      ]
+
+    total_horas_filtro = round(df_massa_filtrada["Total Horas (h)"].sum(), 2)
+    st.caption(
+        f"Exibindo **{len(df_massa_filtrada)}** de"
+        f" **{len(df_massa_exibicao)}** registros | Total de horas na seleção:"
+        f" **{total_horas_filtro} h**"
+    )
+
+    st.dataframe(df_massa_filtrada, use_container_width=True)
+
+    excel_massa_bytes = gerar_excel_bytes(df_massa_filtrada)
     data_ini_str = data_inicio_massa.strftime("%Y-%m-%d")
-    st.download_button(
-        label="📥 Baixar Planilha Consolidada em Massa (.xlsx)",
-        data=excel_massa_bytes,
-        file_name=f"Logbook_ROV_Massa_{data_ini_str}_{dias_proc}dias.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
-
-    st.subheader("📊 Resumo Acumulado de Horas no Período")
-    df_saldos_massa = pd.DataFrame(
-        list(horas_massa.items()),
-        columns=["Colaborador", "Total Horas Acumuladas no Período (h)"],
-    )
-    st.dataframe(df_saldos_massa, use_container_width=True)
+    sufixo_arquivo = (
+        f"_{'_'.join([c.replace(' ', '_') for c in filtro_colaboradores[:2]])}"
+        if filtro_colaboradores
+        else ""
